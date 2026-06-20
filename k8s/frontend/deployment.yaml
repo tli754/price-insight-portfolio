@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: price-insight
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          # Image is updated by CI: kubectl set image deployment/frontend frontend=<image>:<sha>
+          image: australia-southeast1-docker.pkg.dev/acme-pricewatch/price-insight/price-insight-frontend:latest
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - secretRef:
+                name: frontend-secrets
+          env:
+            - name: NODE_ENV
+              value: production
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: 3000
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 40m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

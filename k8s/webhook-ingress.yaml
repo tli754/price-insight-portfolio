@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: price-insight-webhook
+  namespace: price-insight
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: www.pricewatch.example.dev
+      http:
+        paths:
+          - path: /webhook
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 4000

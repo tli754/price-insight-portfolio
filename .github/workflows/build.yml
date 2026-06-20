@@ -1,0 +1,143 @@
+name: Build
+
+run-name: Build ${{ inputs.target }} from ${{ inputs.ref }} by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or commit to build'
+        required: false
+        default: 'master'
+      target:
+        description: 'Which image to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - backend
+          - frontend
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  GAR_REGION: australia-southeast1
+  GAR_REPO: price-insight
+  RUN_REGION: australia-southeast1
+  PROJECT_ID: acme-pricewatch
+  BACKEND_IMAGE: australia-southeast1-docker.pkg.dev/acme-pricewatch/price-insight/price-insight-backend
+  FRONTEND_IMAGE: australia-southeast1-docker.pkg.dev/acme-pricewatch/price-insight/price-insight-frontend
+
+jobs:
+  build-backend:
+    name: Build Backend
+    if: inputs.target == 'all' || inputs.target == 'backend'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      sha: ${{ steps.sha.outputs.full_sha }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve commit SHA
+        id: sha
+        run: echo "full_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GAR_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push backend image (SHA-tagged, immutable)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:${{ steps.sha.outputs.full_sha }}
+            ${{ env.BACKEND_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.BACKEND_IMAGE }}:latest
+          cache-to: type=inline
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Backend image built"
+            echo "- Commit SHA: \`${{ steps.sha.outputs.full_sha }}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- Tag: \`${{ env.BACKEND_IMAGE }}:${{ steps.sha.outputs.full_sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-frontend:
+    name: Build Frontend
+    if: inputs.target == 'all' || inputs.target == 'frontend'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      sha: ${{ steps.sha.outputs.full_sha }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve commit SHA
+        id: sha
+        run: echo "full_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GAR_REGION }}-docker.pkg.dev --quiet
+
+      - name: Resolve backend URL (build-time proxy target)
+        id: backend_url
+        run: |
+          URL=$(gcloud run services describe backend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push frontend image (SHA-tagged, immutable)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.sha.outputs.full_sha }}
+            ${{ env.FRONTEND_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.FRONTEND_IMAGE }}:latest
+          cache-to: type=inline
+          build-args: |
+            NUXT_BACKEND_URL=${{ steps.backend_url.outputs.url }}
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Frontend image built"
+            echo "- Commit SHA: \`${{ steps.sha.outputs.full_sha }}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- Tag: \`${{ env.FRONTEND_IMAGE }}:${{ steps.sha.outputs.full_sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

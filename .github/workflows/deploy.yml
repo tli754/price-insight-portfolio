@@ -1,0 +1,262 @@
+name: Deploy
+
+run-name: Deploy ${{ inputs.target }} from ${{ inputs.commit_sha != '' && inputs.commit_sha || 'selected branch' }} by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which service to deploy'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - backend
+          - frontend
+          - order-worker
+      commit_sha:
+        description: 'Commit SHA to deploy. Leave empty to use the latest SHA from the selected branch.'
+        required: false
+
+concurrency:
+  group: cloud-run-production
+  cancel-in-progress: false
+
+env:
+  GAR_REGION: australia-southeast1
+  RUN_REGION: australia-southeast1
+  PROJECT_ID: acme-pricewatch
+  BACKEND_IMAGE: australia-southeast1-docker.pkg.dev/acme-pricewatch/price-insight/price-insight-backend
+  FRONTEND_IMAGE: australia-southeast1-docker.pkg.dev/acme-pricewatch/price-insight/price-insight-frontend
+
+jobs:
+  resolve:
+    name: Resolve SHA and verify images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      deploy_sha: ${{ steps.sha.outputs.deploy_sha }}
+      backend_digest: ${{ steps.backend_digest.outputs.digest }}
+      frontend_digest: ${{ steps.frontend_digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate commit SHA
+        id: sha
+        run: |
+          INPUT_SHA="${{ inputs.commit_sha }}"
+          if [ -z "$INPUT_SHA" ]; then
+            DEPLOY_SHA="$GITHUB_SHA"
+          elif DEPLOY_SHA=$(git rev-parse --verify "${INPUT_SHA}^{commit}" 2>/dev/null); then
+            :
+          else
+            echo "::error::commit_sha '$INPUT_SHA' is not a valid commit in this repository"
+            exit 1
+          fi
+          echo "deploy_sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify backend image exists and resolve digest
+        id: backend_digest
+        if: inputs.target == 'all' || inputs.target == 'backend' || inputs.target == 'order-worker'
+        run: |
+          DIGEST=$(gcloud artifacts docker images describe \
+            "${{ env.BACKEND_IMAGE }}:${{ steps.sha.outputs.deploy_sha }}" \
+            --format='value(image_summary.digest)') || {
+              echo "::error::backend image not found for SHA ${{ steps.sha.outputs.deploy_sha }} — run Build first"
+              exit 1
+            }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Verify frontend image exists and resolve digest
+        id: frontend_digest
+        if: inputs.target == 'all' || inputs.target == 'frontend'
+        run: |
+          DIGEST=$(gcloud artifacts docker images describe \
+            "${{ env.FRONTEND_IMAGE }}:${{ steps.sha.outputs.deploy_sha }}" \
+            --format='value(image_summary.digest)') || {
+              echo "::error::frontend image not found for SHA ${{ steps.sha.outputs.deploy_sha }} — run Build first"
+              exit 1
+            }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+  deploy-backend:
+    name: Deploy Backend
+    needs: resolve
+    if: inputs.target == 'all' || inputs.target == 'backend'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Record current revision (for rollback)
+        id: previous
+        run: |
+          PREV=$(gcloud run services describe backend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.traffic[0].revisionName)')
+          echo "revision=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy by digest
+        id: deploy
+        run: |
+          gcloud run deploy backend \
+            --image="${{ env.BACKEND_IMAGE }}@${{ needs.resolve.outputs.backend_digest }}" \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}"
+          NEW_REV=$(gcloud run services describe backend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.traffic[0].revisionName)')
+          echo "revision=$NEW_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Health check
+        id: health
+        continue-on-error: true
+        run: |
+          URL=$(gcloud run services describe backend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.url)')
+          curl -sf "$URL/api/health" \
+            --max-time 10 \
+            --retry 6 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            --retry-all-errors
+
+      - name: Roll back on health-check failure
+        if: steps.health.outcome == 'failure'
+        run: |
+          gcloud run services update-traffic backend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --to-revisions="${{ steps.previous.outputs.revision }}=100"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Backend deploy"
+            echo "- Requested SHA: \`${{ needs.resolve.outputs.deploy_sha }}\`"
+            echo "- Deployed digest: \`${{ needs.resolve.outputs.backend_digest }}\`"
+            echo "- New revision: \`${{ steps.deploy.outputs.revision }}\`"
+            echo "- Health check: ${{ steps.health.outcome }}"
+            if [ "${{ steps.health.outcome }}" = "failure" ]; then
+              echo "- Rolled back to: \`${{ steps.previous.outputs.revision }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail job if health check failed
+        if: steps.health.outcome == 'failure'
+        run: |
+          echo "Health check failed — rolled back to ${{ steps.previous.outputs.revision }}"
+          exit 1
+
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: [resolve, deploy-backend]
+    if: |
+      always() &&
+      needs.resolve.result == 'success' &&
+      (
+        inputs.target == 'frontend' ||
+        (inputs.target == 'all' && needs.deploy-backend.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy by digest
+        id: deploy
+        run: |
+          gcloud run deploy frontend \
+            --image="${{ env.FRONTEND_IMAGE }}@${{ needs.resolve.outputs.frontend_digest }}" \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}"
+          NEW_REV=$(gcloud run services describe frontend \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.traffic[0].revisionName)')
+          echo "revision=$NEW_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Frontend deploy"
+            echo "- Requested SHA: \`${{ needs.resolve.outputs.deploy_sha }}\`"
+            echo "- Deployed digest: \`${{ needs.resolve.outputs.frontend_digest }}\`"
+            echo "- New revision: \`${{ steps.deploy.outputs.revision }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-order-worker:
+    name: Deploy Order Worker
+    needs: [resolve, deploy-backend]
+    if: |
+      always() &&
+      needs.resolve.result == 'success' &&
+      (needs.deploy-backend.result == 'success' || needs.deploy-backend.result == 'skipped') &&
+      (inputs.target == 'all' || inputs.target == 'backend' || inputs.target == 'order-worker')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/111111111111/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: price-insight-ci@acme-pricewatch.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy by digest
+        id: deploy
+        run: |
+          gcloud run deploy order-worker \
+            --image="${{ env.BACKEND_IMAGE }}@${{ needs.resolve.outputs.backend_digest }}" \
+            --command=node \
+            --args=dist/order-worker-server.js \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}"
+          NEW_REV=$(gcloud run services describe order-worker \
+            --region="${{ env.RUN_REGION }}" --project="${{ env.PROJECT_ID }}" \
+            --format='value(status.traffic[0].revisionName)')
+          echo "revision=$NEW_REV" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Order-worker deploy"
+            echo "- Requested SHA: \`${{ needs.resolve.outputs.deploy_sha }}\`"
+            echo "- Deployed digest (same image as backend): \`${{ needs.resolve.outputs.backend_digest }}\`"
+            echo "- New revision: \`${{ steps.deploy.outputs.revision }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
