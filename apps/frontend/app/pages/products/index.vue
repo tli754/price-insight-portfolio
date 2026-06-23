@@ -141,7 +141,7 @@ const colWidths = reactive({
   title: 400,
   price: 110,
   inventory: 110,
-  inventoryAlert: 120,
+  inventoryAlert: 210,
   status: 100,
   avgCompetitor: 140,
   sales7d: 130,
@@ -171,14 +171,8 @@ function fmtSales(qty: number | undefined, rev: number | undefined): string {
   return `${qty} ($${Math.round(rev ?? 0).toLocaleString()})`
 }
 
-function inventoryAlert(p: ProductRow): { months: string; color: 'error' | 'warning' | 'success' } | null {
-  if (p.inventoryQuantity == null || !p.sold90d) return null
-  const monthlyRate = p.sold90d / 3
-  const months = p.inventoryQuantity / monthlyRate
-  const label = months >= 12 ? `${Math.floor(months)}mo` : `${months.toFixed(1)}mo`
-  if (months < 1) return { months: label, color: 'error' }
-  if (months < 3) return { months: label, color: 'warning' }
-  return { months: label, color: 'success' }
+function inventoryAlert(p: ProductRow) {
+  return calcInventoryAlert(p.inventoryQuantity, p.sold7d, p.sold30d, p.sold90d)
 }
 
 onMounted(() => {
@@ -259,10 +253,10 @@ onUnmounted(() => {
               <col :style="`width: ${colWidths.inventory}px`" />
               <col :style="`width: ${colWidths.inventoryAlert}px`" />
               <col :style="`width: ${colWidths.status}px`" />
-              <col :style="`width: ${colWidths.avgCompetitor}px`" />
               <col :style="`width: ${colWidths.sales7d}px`" />
               <col :style="`width: ${colWidths.sales30d}px`" />
               <col :style="`width: ${colWidths.sales90d}px`" />
+              <col :style="`width: ${colWidths.avgCompetitor}px`" />
             </colgroup>
             <thead>
               <tr class="border-b border-default/50 bg-default/20">
@@ -300,10 +294,6 @@ onUnmounted(() => {
                   <div class="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary-400/40" @mousedown.prevent="startResize($event, 'status')" />
                 </th>
                 <th class="relative border-r border-default/30 px-3 py-2 text-right font-medium text-toned">
-                  Avg Competitor
-                  <div class="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary-400/40" @mousedown.prevent="startResize($event, 'avgCompetitor')" />
-                </th>
-                <th class="relative border-r border-default/30 px-3 py-2 text-right font-medium text-toned">
                   <button class="flex w-full cursor-pointer items-center justify-end gap-1 hover:text-highlighted" @click="toggleSort('sold7d')">
                     <UIcon v-if="sortKey === 'sold7d'" :name="sortDir === 'asc' ? 'i-lucide-arrow-up' : 'i-lucide-arrow-down'" class="h-3 w-3" />
                     <UIcon v-else name="i-lucide-arrow-up-down" class="h-3 w-3 opacity-40" />
@@ -319,12 +309,16 @@ onUnmounted(() => {
                   </button>
                   <div class="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary-400/40" @mousedown.prevent="startResize($event, 'sales30d')" />
                 </th>
-                <th class="px-3 py-2 text-right font-medium text-toned">
+                <th class="relative border-r border-default/30 px-3 py-2 text-right font-medium text-toned">
                   <button class="flex w-full cursor-pointer items-center justify-end gap-1 hover:text-highlighted" @click="toggleSort('sold90d')">
                     <UIcon v-if="sortKey === 'sold90d'" :name="sortDir === 'asc' ? 'i-lucide-arrow-up' : 'i-lucide-arrow-down'" class="h-3 w-3" />
                     <UIcon v-else name="i-lucide-arrow-up-down" class="h-3 w-3 opacity-40" />
                     90d Sales
                   </button>
+                  <div class="absolute inset-y-0 right-0 w-1 cursor-col-resize hover:bg-primary-400/40" @mousedown.prevent="startResize($event, 'sales90d')" />
+                </th>
+                <th class="px-3 py-2 text-right font-medium text-toned">
+                  Avg Competitor
                 </th>
               </tr>
             </thead>
@@ -364,7 +358,7 @@ onUnmounted(() => {
                 </td>
                 <td class="px-3 py-2 text-center">
                   <UBadge v-if="inventoryAlert(p)" :color="inventoryAlert(p)!.color" variant="soft" size="sm">
-                    {{ inventoryAlert(p)!.months }}
+                    {{ inventoryAlert(p)!.text }}
                   </UBadge>
                   <span v-else class="text-gray-400">—</span>
                 </td>
@@ -372,15 +366,6 @@ onUnmounted(() => {
                   <UBadge :color="statusColor(p.status)" variant="soft" size="sm">
                     {{ p.status }}
                   </UBadge>
-                </td>
-                <td class="px-3 py-2 text-right font-mono text-sm">
-                  <template v-if="p.avgCompetitorPrice != null">
-                    <span :class="p.avgCompetitorPrice < (p.price ?? Infinity) ? 'text-red-500' : 'text-green-600'">
-                      ${{ p.avgCompetitorPrice.toFixed(2) }}
-                    </span>
-                    <span class="ml-1 text-xs text-gray-400">({{ p.confirmedCompetitorCount }})</span>
-                  </template>
-                  <span v-else class="text-gray-400">—</span>
                 </td>
                 <td class="px-3 py-2 text-right font-mono text-sm text-gray-600">
                   {{ fmtSales(p.sold7d, p.revenue7d) }}
@@ -390,6 +375,15 @@ onUnmounted(() => {
                 </td>
                 <td class="px-3 py-2 text-right font-mono text-sm text-gray-600">
                   {{ fmtSales(p.sold90d, p.revenue90d) }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-sm">
+                  <template v-if="p.avgCompetitorPrice != null">
+                    <span :class="p.avgCompetitorPrice < (p.price ?? Infinity) ? 'text-red-500' : 'text-green-600'">
+                      ${{ p.avgCompetitorPrice.toFixed(2) }}
+                    </span>
+                    <span class="ml-1 text-xs text-gray-400">({{ p.confirmedCompetitorCount }})</span>
+                  </template>
+                  <span v-else class="text-gray-400">—</span>
                 </td>
               </tr>
             </tbody>
